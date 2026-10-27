@@ -1,3 +1,5 @@
 # Wortliste A1 Trainer
 
 A 30-day trainer for the Goethe-Zertifikat A1 word list: multiple choice, typing, listening and scored speaking (Safari / Chrome), with spaced reviews. Open the GitHub Pages site and practise in the browser.
+
+Live site: https://vocusbuild.github.io/learn-german-a1/
