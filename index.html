@@ -186,6 +186,7 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .center { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; }
 
 .typebox { display: flex; flex-direction: column; gap: 10px; }
+input, textarea, select { box-sizing: border-box; max-width: 100%; }
 .typebox input { font: inherit; font-size: 22px; font-weight: 600; padding: 14px 16px; border-radius: var(--r); border: 2px solid var(--line); background: var(--surface); color: var(--ink); width: 100%; }
 .typebox input.okc { border-color: var(--ok); } .typebox input.badc { border-color: var(--bad); }
 .keys { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -238,6 +239,11 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .tips ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 15px; }
 .scorerow { display: flex; align-items: baseline; gap: 12px; }
 .verdict { font-family: var(--f-display); font-size: 24px; font-weight: 700; }
+.diff { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; font-size: 18px; font-weight: 600; }
+.diff .dl { display: inline-block; min-width: 92px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.diff mark { border-radius: 3px; padding: 0 1px; color: var(--surface); }
+.diff mark.you { background: var(--bad); text-decoration: line-through; }
+.diff mark.fix { background: var(--ok); }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 10px; font-size: 14px; z-index: 20; max-width: calc(100% - 32px); }
 </style>
 
@@ -650,11 +656,44 @@ function gradeTyped(w, input) {
     const m = raw.match(/^(der|die|das)\s+(.+)$/i), bodyN = norm(p.body);
     if (m && norm(m[2]) === bodyN) return { ok: false, kind: 'article', said: m[1].toLowerCase() };
     if (!m && n === bodyN) return { ok: false, kind: 'noart' };
-    if (m && m[1].toLowerCase() === p.art && bodyN.length >= 5 && lev(norm(m[2]), bodyN) === 1) return { ok: true, kind: 'typo' };
+    if (m && m[1].toLowerCase() === p.art && bodyN.length >= 5 && lev(norm(m[2]), bodyN) === 1) return { ok: true, kind: 'typo', yBody: m[2].trim(), tBody: p.body, art: p.art, saidArt: p.art };
   }
-  for (const v of p.variants) { const nv = norm(v); if (nv.length >= 6 && lev(n, nv) === 1) return { ok: true, kind: 'typo' }; }
+  for (const v of p.variants) { const nv = norm(v); if (nv.length >= 6 && lev(n, nv) === 1) return { ok: true, kind: 'typo', yBody: raw, tBody: v, art: '', saidArt: '' }; }
   for (const x of SYN.get(w.en) || []) if (x !== w && parse(x).variants.some(v => norm(v) === n)) return { ok: true, kind: 'syn', other: x };
+  // Close but not right: tell the learner it is a spelling problem and show where.
+  const said = raw.match(/^(der|die|das)\s+(.+)$/i);
+  let best = null;
+  for (const v of p.variants) {
+    const vm = v.match(/^(der|die|das) (.+)$/);
+    const tBody = vm ? vm[2] : v, yBody = (vm && said) ? said[2].trim() : raw;
+    const L = norm(tBody).length, d = lev(norm(yBody), norm(tBody));
+    const lim = L <= 4 ? 1 : L <= 8 ? 2 : 3;
+    if (d > 0 && d <= lim && (!best || d < best.d)) best = { d, tBody, yBody, art: vm ? vm[1] : '', saidArt: (vm && said) ? said[1].toLowerCase() : '' };
+  }
+  if (best) return Object.assign({ ok: false, kind: 'spell' }, best);
   return { ok: false, kind: 'wrong' };
+}
+/* Mark which letters differ between what was typed and the right spelling. */
+function spellDiff(typed, target) {
+  const a = [...typed], b = [...target], A = a.map(c => c.toLowerCase()), B = b.map(c => c.toLowerCase());
+  const n = A.length, m = B.length, D = [];
+  for (let i = 0; i <= n; i++) { D.push(new Array(m + 1).fill(0)); D[i][0] = i; }
+  for (let j = 0; j <= m; j++) D[0][j] = j;
+  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) D[i][j] = Math.min(D[i - 1][j] + 1, D[i][j - 1] + 1, D[i - 1][j - 1] + (A[i - 1] === B[j - 1] ? 0 : 1));
+  const ym = new Array(n).fill(false), tm = new Array(m).fill(false);
+  let i = n, j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && D[i][j] === D[i - 1][j - 1] + (A[i - 1] === B[j - 1] ? 0 : 1)) { if (A[i - 1] !== B[j - 1]) { ym[i - 1] = true; tm[j - 1] = true; } i--; j--; }
+    else if (i > 0 && D[i][j] === D[i - 1][j] + 1) { ym[i - 1] = true; i--; }
+    else { tm[j - 1] = true; j--; }
+  }
+  const paint = (chars, marks, cls) => { let out = '', open = false; chars.forEach((c, k) => { if (marks[k] && !open) { out += `<mark class="${cls}">`; open = true; } if (!marks[k] && open) { out += '</mark>'; open = false; } out += esc(c); }); return out + (open ? '</mark>' : ''); };
+  return { you: paint(a, ym, 'you'), right: paint(b, tm, 'fix') };
+}
+function diffHTML(g) {
+  const d = spellDiff(g.yBody, g.tBody);
+  const artY = g.saidArt ? esc(g.saidArt) + ' ' : '', artR = g.art ? `<span style="color:var(--${g.art})">${g.art}</span> ` : '';
+  return `<div class="diff"><div><span class="dl">You wrote</span><span lang="de">${artY}${d.you}</span></div><div><span class="dl">Correct</span><span lang="de">${artR}${d.right}</span></div></div>`;
 }
 
 /* ================= views ================= */
@@ -816,7 +855,7 @@ function feedbackHTML() {
   const s = SES, f = s.feedback; if (!f) return '';
   const w = s.card.w;
   return `<div class="fb ${f.ok ? 'ok' : 'bad'}" role="status">
-    <div class="fb-h">${f.ok ? 'Richtig!' : 'Nicht ganz'}</div>
+    <div class="fb-h">${f.head || (f.ok ? 'Richtig!' : 'Nicht ganz')}</div>
     ${f.msg ? `<div class="fb-m">${f.msg}</div>` : ''}
     <div class="fb-a"><span lang="de">${deHTML(w)}</span> <span class="muted">· ${esc(w.en)}</span></div>
     ${exampleHTML(w)}
@@ -953,11 +992,17 @@ function answerTyped() {
   const inp = document.getElementById('ans'); s.typed = inp ? inp.value : '';
   const w = s.card.w, p = parse(w), g = gradeTyped(w, s.typed);
   if (g.kind === 'empty') { toast('Type your answer first'); return; }
-  let ok = g.ok;
+  let ok = g.ok, head = '';
   if (ok && s.hintN >= 2) ok = false;
+  let artNote = '';
+  if (g.kind === 'spell' && g.art) artNote = !g.saidArt ? ` Also add the article: <b style="color:var(--${g.art})">${g.art}</b>.` : g.saidArt !== g.art ? ` The article is wrong too: it's <b style="color:var(--${g.art})">${g.art}</b>.` : ' The article is right.';
+  const capNote = (g.kind === 'exact' && p.kind === 'noun' && /^(der|die|das\s+)?[a-zäöü]/.test(s.typed.trim().replace(/^(der|die|das)\s+/i, ''))) ? `Tip: German nouns start with a capital letter: <b lang="de">${esc(p.body)}</b>.` : '';
+  if (g.kind === 'spell') head = 'Misspelled';
+  if (g.kind === 'typo' && ok) head = 'Richtig · small typo';
   const msgs = {
-    exact: s.hintN ? 'Correct, with a hint.' : '',
-    typo: `Accepted, but check the spelling.`,
+    exact: s.hintN ? 'Correct, with a hint.' : capNote,
+    typo: `Accepted, but it's slightly misspelled.${diffHTML(g)}`,
+    spell: `Close, but the spelling is wrong.${artNote}${diffHTML(g)}`,
     syn: g.other ? `<span lang="de">${esc(g.other.de)}</span> is also right. This card's word is:` : '',
     article: `Right word, wrong article: it's <b style="color:var(--${p.art})">${p.art}</b>, not ${esc(g.said || '')}.`,
     noart: `Add the article. Nouns are learned with der, die or das.`,
@@ -965,7 +1010,7 @@ function answerTyped() {
   };
   let msg = msgs[g.kind] || '';
   if (g.ok && !ok) msg = 'You needed most of the word as a hint, so this one comes back.';
-  s.answered = true; s.feedback = { ok, msg };
+  s.answered = true; s.feedback = { ok, msg, head };
   record(ok); playWord(w); render();
 }
 async function doMic(auto) {
@@ -1084,7 +1129,8 @@ document.addEventListener('keydown', e => {
   }
 });
 
-if (location.hash === '#selftest') window.__wl = { remarks, speechScore, parse, WORDS, wordTips };
+try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* ignore */ }
+if (location.hash === '#selftest') window.__wl = { remarks, speechScore, parse, WORDS, wordTips, gradeTyped, diffHTML };
 render();
 initCloud();
 })();
