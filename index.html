@@ -371,13 +371,34 @@ const AC = window.AudioContext || window.webkitAudioContext;
 let ctx = null, curSrc = null;
 const packs = new Map(), buffers = new Map();
 const canAudio = () => S.opt.audio && (!!AC || TTS);
+// iPhone note: using the microphone switches the phone's audio mode, which can leave an old audio
+// context silent or routed to the earpiece. So after listening we rebuild the context on the next tap.
+let ctxStale = false, LISTENING = false, curEl = null;
+function stopAudio() {
+  if (curSrc) { try { curSrc.stop(); } catch (e) { /* */ } curSrc = null; }
+  if (curEl) { try { curEl.pause(); } catch (e) { /* */ } curEl = null; }
+  if (TTS) try { speechSynthesis.cancel(); } catch (e) { /* */ }
+}
 function unlockAudio() {
   if (!AC) return;
   try {
-    if (navigator.audioSession) navigator.audioSession.type = 'playback'; // play even when the iPhone is on silent
-    if (!ctx) ctx = new AC();
-    if (ctx.state === 'suspended') ctx.resume();
-  } catch (e) { /* ignore */ }
+    if (navigator.audioSession && !LISTENING && navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback'; // speaker, even on silent
+    if (ctx && (ctxStale || ctx.state === 'closed' || ctx.state === 'interrupted')) { try { ctx.close(); } catch (e) { /* */ } ctx = null; }
+    if (!ctx) { ctx = new AC(); ctxStale = false; ctx.onstatechange = () => { if (ctx && ctx.state === 'interrupted') ctxStale = true; }; }
+    if (ctx.state !== 'running') ctx.resume().catch(() => { ctxStale = true; });
+  } catch (e) { ctxStale = true; }
+}
+function playElement(b64) {
+  return new Promise((res, rej) => {
+    try {
+      const bin = atob(b64), u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([u8], { type: 'audio/mpeg' }));
+      const a = new Audio(url); curEl = a;
+      a.onended = () => URL.revokeObjectURL(url);
+      a.play().then(res, rej);
+    } catch (e) { rej(e); }
+  });
 }
 const packName = d => 'audio/a' + String(d).padStart(2, '0') + '.json';
 function loadPack(d) {
@@ -392,19 +413,24 @@ function decode(b64) {
 async function playKey(w, kind) {
   if (!S.opt.audio) return;
   const key = kind + w.id, fallback = kind === 'e' ? w.ex : parse(w).spoken;
+  let b64 = null;
   try {
     unlockAudio();
-    if (!ctx) throw new Error('no audio');
+    const pk = await loadPack(w.d);
+    b64 = pk && pk[key];
+    if (!b64) throw new Error('missing');
+    if (!ctx) throw new Error('no context');
+    if (ctx.state !== 'running') await Promise.race([ctx.resume(), new Promise(r => setTimeout(r, 350))]);
+    if (ctx.state !== 'running') throw new Error('context ' + ctx.state);
     let buf = buffers.get(key);
-    if (!buf) {
-      const pk = await loadPack(w.d);
-      if (!pk || !pk[key]) throw new Error('missing');
-      buf = await decode(pk[key]); buffers.set(key, buf);
-    }
-    if (curSrc) try { curSrc.stop(); } catch (e) { /* */ }
-    if (TTS) speechSynthesis.cancel();
+    if (!buf) { buf = await decode(b64); buffers.set(key, buf); }
+    stopAudio();
     const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start(0); curSrc = src;
-  } catch (e) { say(fallback); }
+  } catch (e) {
+    ctxStale = true;
+    if (b64) { try { stopAudio(); await playElement(b64); return; } catch (e2) { /* fall through */ } }
+    say(fallback);
+  }
 }
 const playWord = w => playKey(w, 'w');
 const playEx = w => playKey(w, 'e');
@@ -433,15 +459,25 @@ function listen() {
     try { rec = new SR(); } catch (e) { reject('unsupported'); return; }
     REC = rec;
     rec.lang = 'de-DE'; rec.interimResults = false; rec.maxAlternatives = 5; rec.continuous = false;
-    let got = null, err = null;
-    const timer = setTimeout(() => { try { rec.stop(); } catch (e) { /* */ } }, 7000);
+    let got = null, err = null, finished = false;
+    stopAudio(); LISTENING = true;
+    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) { /* */ }
+    const done = () => {
+      if (finished) return; finished = true; clearTimeout(timer); REC = null; LISTENING = false;
+      try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* */ }
+      ctxStale = true; // rebuilt on the next tap so sound comes from the speaker again
+      if (got) resolve(got); else if (err && err !== 'no-speech' && err !== 'aborted') reject(err); else resolve([]);
+    };
+    const timer = setTimeout(() => { try { rec.stop(); } catch (e) { /* */ } setTimeout(() => { try { rec.abort(); } catch (e) { /* */ } done(); }, 1500); }, 7000);
     rec.onresult = ev => {
       const res = ev.results[0]; got = [];
       for (let i = 0; i < res.length; i++) got.push({ t: res[i].transcript, c: res[i].confidence || 0 });
+      try { rec.stop(); } catch (e) { /* release the microphone right away */ }
+      setTimeout(done, 1200);
     };
     rec.onerror = ev => { err = ev.error || 'error'; };
-    rec.onend = () => { clearTimeout(timer); REC = null; if (got) resolve(got); else if (err && err !== 'no-speech' && err !== 'aborted') reject(err); else resolve([]); };
-    try { rec.start(); } catch (e) { clearTimeout(timer); reject('start-failed'); }
+    rec.onend = done;
+    try { rec.start(); } catch (e) { LISTENING = false; clearTimeout(timer); reject('start-failed'); }
   });
 }
 function speechScore(w, alts) {
@@ -572,6 +608,7 @@ function startSession(kind) {
   SES = s; VIEW = 'session'; touch(); nextCard();
 }
 function nextCard() {
+  if (REC) { try { REC.abort(); } catch (e) { /* */ } }
   const s = SES; s.answered = false; s.feedback = null; s.speech = null; s.typed = ''; s.hintN = 0; s.revealed = false; s.picked = -1; s.pickedArt = '';
   if (s.queue.length) { s.card = s.queue.shift(); prepCard(); return render(); }
   const ready = s.active.length < 3 || s.active.every(w => get(w.id)[0] >= 2);
@@ -803,6 +840,7 @@ function vHome() {
           <button data-act="opt-audio" data-v="0" aria-pressed="${!S.opt.audio}">Off</button>
         </div>
         <p>Every word and example is recorded with a neural voice built from a native German speaker, at a slightly slow learner pace. If a recording can't load, your device's own German voice reads it instead.</p>
+        <button class="btn ghost" data-act="soundtest">Test sound</button>
       </div>
       <div class="field"><label>Progress</label>
         ${CONFIRM_RESET ? `<div class="confirm"><p>Erase all progress for all ${WORDS.length} words? This can't be undone.</p><div class="row"><button class="btn" data-act="reset-yes">Erase progress</button><button class="btn ghost" data-act="reset-no">Keep it</button></div></div>`
@@ -1001,8 +1039,8 @@ function answerTyped() {
   if (g.kind === 'typo' && ok) head = 'Richtig · small typo';
   const msgs = {
     exact: s.hintN ? 'Correct, with a hint.' : capNote,
-    typo: `Accepted, but it's slightly misspelled.${diffHTML(g)}`,
-    spell: `Close, but the spelling is wrong.${artNote}${diffHTML(g)}`,
+    typo: `Accepted, but it's slightly misspelled.${g.tBody ? diffHTML(g) : ''}`,
+    spell: `Close, but the spelling is wrong.${artNote}${g.tBody ? diffHTML(g) : ''}`,
     syn: g.other ? `<span lang="de">${esc(g.other.de)}</span> is also right. This card's word is:` : '',
     article: `Right word, wrong article: it's <b style="color:var(--${p.art})">${p.art}</b>, not ${esc(g.said || '')}.`,
     noart: `Add the article. Nouns are learned with der, die or das.`,
@@ -1025,7 +1063,6 @@ async function doMic(auto) {
     s.speech = { state: 'done', score: r.s, heard: r.t, art: r.art, remarks: remarks(card.w, r) };
     const m = mut(card.w.id); m[5] = r.s; touch();
     render();
-    if (r.s < 85) setTimeout(() => { if (SES === s && s.card === card) playWord(card.w); }, 400);
   } catch (err) {
     if (!SES || SES !== s || s.card !== card) return;
     if (auto) { autoMicOff = true; s.speech = null; render(); return; }
@@ -1081,7 +1118,7 @@ app.addEventListener('click', e => {
     case 'weak': startSession('weak'); break;
     case 'home': SES = null; VIEW = 'home'; render(); break;
     case 'browse': BROWSE = +b.dataset.n; VIEW = 'browse'; render(); break;
-    case 'quit': clearTimeout(autoT); quit(); break;
+    case 'quit': clearTimeout(autoT); if (REC) { try { REC.abort(); } catch (er) { /* */ } } quit(); break;
     case 'introok': { const m = mut(SES.card.w.id); m[0] = 1; SES.last.push(SES.card.w.id); touch(); nextCard(); break; }
     case 'pick': answerMC(+b.dataset.i); break;
     case 'art': answerArt(b.dataset.v); break;
@@ -1101,6 +1138,7 @@ app.addEventListener('click', e => {
     case 'opt-speak': S.opt.speak = b.dataset.v; touch(); render(); document.getElementById('settings').open = true; break;
     case 'opt-audio': S.opt.audio = b.dataset.v === '1'; touch(); render(); document.getElementById('settings').open = true; break;
     case 'mictest': micTest(b); break;
+    case 'soundtest': { ctxStale = true; unlockAudio(); const hw = WORDS.find(x => x.de === 'hallo'); if (hw) playWord(hw); toast('Playing „hallo“. If you hear nothing, check the volume and the side switch.'); break; }
     case 'reset': CONFIRM_RESET = true; render(); document.getElementById('settings').open = true; break;
     case 'reset-no': CONFIRM_RESET = false; render(); document.getElementById('settings').open = true; break;
     case 'reset-yes': { const opt = S.opt; S = fresh(); S.opt = opt; CONFIRM_RESET = false; touch(); render(); toast('Progress erased'); break; }
@@ -1130,7 +1168,7 @@ document.addEventListener('keydown', e => {
 });
 
 try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* ignore */ }
-if (location.hash === '#selftest') window.__wl = { remarks, speechScore, parse, WORDS, wordTips, gradeTyped, diffHTML };
+if (location.hash === '#selftest') window.__wl = { remarks, speechScore, parse, WORDS, wordTips, gradeTyped, diffHTML, audioState: () => ({ ctx: ctx && ctx.state, stale: ctxStale, src: !!curSrc, el: !!curEl }), markStale: () => { ctxStale = true; } };
 render();
 initCloud();
 })();
