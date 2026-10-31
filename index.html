@@ -452,6 +452,19 @@ function unlockAudio() {
     if (ctx.state !== 'running') ctx.resume().catch(() => { ctxStale = true; });
   } catch (e) { ctxStale = true; }
 }
+// iPhone: switching to another app interrupts web audio. On return the old context can report
+// "running" yet stay silent, so drop it when the page is hidden and build a fresh one on the next tap.
+function dropAudio() {
+  stopAudio();
+  if (ctx) { try { ctx.close(); } catch (e) { /* */ } ctx = null; }
+  ctxStale = false;
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { if (!LISTENING) dropAudio(); } else ctxStale = true; });
+window.addEventListener('pagehide', () => { if (!LISTENING) dropAudio(); });
+window.addEventListener('pageshow', e => { if (e.persisted) ctxStale = true; });
+// Any tap re-arms audio inside the gesture, which is the only moment iPhone allows it to start.
+const wakeAudio = () => { if (S.opt.audio && !LISTENING && (!ctx || ctxStale || ctx.state !== 'running')) unlockAudio(); };
+['touchend', 'click', 'keydown'].forEach(t => document.addEventListener(t, wakeAudio, { capture: true, passive: true }));
 function playElement(b64) {
   return new Promise((res, rej) => {
     try {
